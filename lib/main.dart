@@ -37,6 +37,7 @@ class DeviceModel {
   SerialPort? port;
   SerialPortReader? reader;
   StreamSubscription<Uint8List>? subscription;
+
   String _buffer = '';
 
   DeviceModel(this.portName);
@@ -47,26 +48,42 @@ class DeviceModel {
 
   void openPort() {
     if (isOpen) return;
+
     try {
       port = SerialPort(portName);
-      if (port!.openReadWrite()) {
-        isOpen = true;
+      if (!port!.openReadWrite()) {
+        debugPrint("Open failed: $portName");
+        closePort();
+        return;
+      }
 
-        // Not: Bazı cihazlar baud rate'i umursamaz (USB-CDC/JTAG).
-        // Yine de seri UART kullanıyorsan burada set edebilirsin.
-        // final cfg = port!.config;
-        // cfg.baudRate = 115200;
-        // port!.config = cfg;
+      isOpen = true;
 
-        reader = SerialPortReader(port!);
-        subscription = reader!.stream.listen((data) {
+      // UART cihazlarda (ESP8266 USB-UART gibi) kritik.
+      // USB-CDC/JTAG cihazlarda etkisi olmayabilir ama zarar vermez.
+      final cfg = port!.config;
+      cfg.baudRate = 115200;
+      cfg.bits = 8;
+      cfg.stopBits = 1;
+      cfg.parity = SerialPortParity.none;
+      cfg.setFlowControl(SerialPortFlowControl.none);
+      port!.config = cfg;
+
+      reader = SerialPortReader(port!);
+      subscription = reader!.stream.listen(
+        (data) {
           rxBytes += data.length;
           updateLastRx();
           _processData(data);
-        });
+        },
+        onError: (e) {
+          debugPrint("Reader error on $portName: $e");
+          closePort();
+        },
+        cancelOnError: true,
+      );
 
-        updateLastRx();
-      }
+      updateLastRx();
     } catch (e) {
       debugPrint("Error opening $portName: $e");
       closePort();
@@ -77,6 +94,7 @@ class DeviceModel {
     "@DATA",
     "@CFG",
     "@ACK",
+    "@HELLO",
     "I (",
     "W (",
     "E (",
@@ -89,33 +107,21 @@ class DeviceModel {
     return false;
   }
 
-  /// @DATA satırını raw kapalıyken payload'sız hale getir.
+  /// Raw kapalıyken @DATA satırında payload'ı gizler.
   /// Örn:
-  ///  @DATA seq=123 us=456 ABCDE...
+  ///  @DATA seq=123 us=456 <payload...>
   /// -> @DATA seq=123 us=456 payload_len=999 (hidden)
   String _sanitizeDataLine(String line) {
-    // Zaten "@DATA" ile başlıyor varsayımıyla çağrılıyor.
-    // İlk 2 alan genelde "seq=..." ve "us=..." oluyor.
-    // Sonrasında payload geliyor.
     final parts = line.split(RegExp(r'\s+'));
-    if (parts.length <= 3) {
-      // Payload yok gibi; olduğu gibi dön.
-      return line;
-    }
+    if (parts.length <= 3) return line;
 
-    // parts[0] = "@DATA"
-    // parts[1] = "seq=..."
-    // parts[2] = "us=..."
     final head = <String>[parts[0], parts[1], parts[2]].join(' ');
 
-    // Payload uzunluğu: head + 1 boşluk sonrası kalan karakter sayısı
-    // Daha doğru olması için line içinde head'i bulup sonrasını ölçelim.
     final idx = line.indexOf(parts[2]);
     if (idx < 0) return "$head payload_hidden";
 
-    // parts[2] bitişi
     final endUs = idx + parts[2].length;
-    // endUs'tan sonra bir veya daha fazla boşluk olabilir
+
     int payloadStart = endUs;
     while (payloadStart < line.length && line[payloadStart] == ' ') {
       payloadStart++;
@@ -125,56 +131,84 @@ class DeviceModel {
     return "$head payload_len=$payloadLen (hidden)";
   }
 
+  void _appendLine(String line) {
+    lines.add(line);
+    if (lines.length > 200) {
+      lines = lines.sublist(lines.length - 200);
+    }
+  }
+
   void _processData(Uint8List data) {
+    // Not: Bu tool "line-based" protokol bekliyor.
+    // Yol B'de ESP tarafı mutlaka '\n' ile satır sonlandırmalı.
     _buffer += String.fromCharCodes(data);
 
-    // Çok satırlı akış: \n ile ayır
-    if (_buffer.contains('\n')) {
-      final parts = _buffer.split('\n');
-      _buffer = parts.removeLast();
+    // Satır sonu normalize: \r\n ve \r -> \n
+    _buffer = _buffer.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
 
-      for (var p in parts) {
-        String line = p.trimRight();
-        if (line.isEmpty) continue;
+    if (!_buffer.contains('\n')) {
+      // Yol B: newline yoksa satır tamamlanmamıştır; bekle.
+      // (Burada "partial" log atmayarak protokol disiplinini koruyoruz.)
+      // Buffer şişmesini de engelleyelim:
+      if (_buffer.length > 8192) {
+        // Çok uzadıysa (muhtemelen newline yok), kırp.
+        _buffer = _buffer.substring(_buffer.length - 2048);
+      }
+      return;
+    }
 
-        if (!showRawPayload) {
-          // 1) Allowed filter
-          if (!_isAllowedLine(line)) continue;
+    final parts = _buffer.split('\n');
+    _buffer = parts.removeLast(); // incomplete tail
 
-          // 2) @DATA özel: payload'ı tamamen gizle
-          if (line.startsWith("@DATA")) {
-            line = _sanitizeDataLine(line);
-          } else {
-            // 3) Diğer allowed satırlar: kırp
-            if (line.length > 140) {
-              line = '${line.substring(0, 140)}… (truncated)';
-            }
-          }
+    for (var p in parts) {
+      String line = p.trimRight();
+      if (line.isEmpty) continue;
+
+      if (!showRawPayload) {
+        // Yol B: sadece protokol satırlarını al
+        if (!_isAllowedLine(line)) continue;
+
+        if (line.startsWith("@DATA")) {
+          // payload'ı gizle
+          line = _sanitizeDataLine(line);
         } else {
-          // Raw açık: yine de UI kilitlenmesin diye 500 char kırp
-          if (line.length > 500) {
-            line = '${line.substring(0, 500)}… (truncated)';
+          // diğer allowed satırlar
+          if (line.length > 140) {
+            line = '${line.substring(0, 140)}… (truncated)';
           }
         }
-
-        lines.add(line);
+      } else {
+        // Raw açık: yine de UI kilitlenmesin
+        if (line.length > 500) {
+          line = '${line.substring(0, 500)}… (truncated)';
+        }
       }
 
-      if (lines.length > 200) {
-        lines = lines.sublist(lines.length - 200);
-      }
+      _appendLine(line);
     }
   }
 
   void closePort() {
-    subscription?.cancel();
+    try {
+      subscription?.cancel();
+    } catch (_) {}
     subscription = null;
-    reader?.close();
+
+    try {
+      reader?.close();
+    } catch (_) {}
     reader = null;
-    if (port != null && port!.isOpen) {
-      port!.close();
-    }
-    port?.dispose();
+
+    try {
+      if (port != null && port!.isOpen) {
+        port!.close();
+      }
+    } catch (_) {}
+
+    try {
+      port?.dispose();
+    } catch (_) {}
+
     port = null;
     isOpen = false;
   }
@@ -227,20 +261,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   void _updateUIAndStatus() {
     final now = DateTime.now();
+
     for (var dev in _devices.values) {
-      // Port hâlâ sistemde mi?
       if (!_availableCache.contains(dev.portName)) {
         if (dev.isOpen) dev.closePort();
         dev.status = DeviceStatus.disconnected;
+        continue;
+      }
+
+      if (dev.isOpen) {
+        final msSinceLastRx = dev.lastRx == null ? 1000 : now.difference(dev.lastRx!).inMilliseconds;
+        dev.status = (msSinceLastRx < 1000) ? DeviceStatus.connected : DeviceStatus.stale;
       } else {
-        if (dev.isOpen) {
-          final msSinceLastRx = dev.lastRx == null ? 1000 : now.difference(dev.lastRx!).inMilliseconds;
-          dev.status = (msSinceLastRx < 1000) ? DeviceStatus.connected : DeviceStatus.stale;
-        } else {
-          dev.status = DeviceStatus.disconnected;
-        }
+        dev.status = DeviceStatus.disconnected;
       }
     }
+
     if (mounted) setState(() {});
   }
 
@@ -267,7 +303,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             icon: const Icon(Icons.refresh),
             onPressed: _scanPorts,
             tooltip: 'Rescan',
-          )
+          ),
         ],
       ),
       body: _devices.isEmpty
@@ -342,7 +378,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 if (dev.isNew && !dev.isOpen)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(4)),
+                    decoration: BoxDecoration(
+                      color: Colors.red,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
                     child: const Text(
                       'NEW',
                       style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
@@ -394,7 +433,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   reverse: true,
                   child: SelectableText(
                     dev.lines.join('\n'),
-                    style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, color: Colors.greenAccent),
+                    style: const TextStyle(
+                      fontFamily: 'Consolas',
+                      fontSize: 12,
+                      color: Colors.greenAccent,
+                    ),
                   ),
                 ),
               ),
